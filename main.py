@@ -75,6 +75,6 @@ async def unified_api_stack(request: Request, call_next):
 @app.get("/ping")
 async def ping(request: Request):
     return {
-        "email": "24ds2000591@ds.study.iitm.ac.in",  
+        "email": "24f3000591@ds.study.iitm.ac.in",  
         "request_id": getattr(request.state, "request_id", "none")
     }
