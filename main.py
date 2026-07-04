@@ -1,109 +1,80 @@
 import time
 import uuid
-from typing import Dict, List
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from collections import defaultdict
+from fastapi import FastAPI, Request, Response, status
 
-app = FastAPI(redirect_slashes=False)
+app = FastAPI()
 
-# Assigned Configuration Values
-ALLOWED_ORIGIN = "https://app-eni6y1.example.com"
-BUCKET_SIZE = 14
-WINDOW_SIZE = 10.0  # seconds
-MY_EMAIL = "24f3000591@ds.study.iitm.ac.in"  # Replace with your logged-in email address
+ASSIGNED_ORIGIN = "https://app-eni6y1.example.com"
+RATE_LIMIT_WINDOW = 14.0  
+RATE_LIMIT_MAX_REQUESTS = 10
 
-# Strict In-Memory Sliding-Window Rate Limiter
-rate_limit_store: Dict[str, List[float]] = {}
+# In-memory sliding window store
+client_buckets = defaultdict(list)
 
-# --- Global HTTP Exception Override ---
-# This ensures that if any HTTPException (like a 429) occurs, the X-Request-ID 
-# and CORS headers are explicitly preserved in the generated error response.
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    origin = request.headers.get("origin")
-    
-    headers = dict(exc.headers) if exc.headers else {}
-    headers["X-Request-ID"] = request_id
-    
-    if origin:
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Access-Control-Allow-Credentials"] = "true"
-        
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=headers
-    )
-
-
-# --- Unified Middleware Pipeline ---
 @app.middleware("http")
-async def unified_middleware(request: Request, call_next):
+async def unified_api_stack(request: Request, call_next):
+    # 1. Capture dynamic inbound matching details
     origin = request.headers.get("origin")
     
-    # 1. Handle preflight OPTIONS requests immediately
+    # 2. Extract or spin up Request Context Tracking 
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    # 3. Short-circuit execute Browser Preflight CORS (OPTIONS) Protocol
     if request.method == "OPTIONS":
         response = Response(status_code=status.HTTP_200_OK)
         if origin:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "X-Request-ID, X-Client-Id, Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Headers"] = "X-Request-ID, X-Client-Id, Content-Type, Authorization, Accept"
+            response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
             response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
 
-    # 2. Resolve and capture Request ID early
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
-        request_id = str(uuid.uuid4())
-    
-    # Cache it in request state so it is accessible globally
-    request.state.request_id = request_id
-
-    # 3. Rate Limiting Check
-    client_id = request.headers.get("X-Client-Id")
-    if client_id:
-        now = time.time()
-        timestamps = rate_limit_store.get(client_id, [])
-        timestamps = [t for t in timestamps if now - t < WINDOW_SIZE]
-        
-        if len(timestamps) >= BUCKET_SIZE:
-            rate_limit_store[client_id] = timestamps
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": "5"}
-            )
+    # 4. Sliding Window Rate Limiting Enforcement
+    response = None
+    if request.url.path == "/ping":
+        client_id = request.headers.get("X-Client-Id")
+        if client_id:
+            current_time = time.time()
+            timestamps = client_buckets[client_id]
             
-        timestamps.append(now)
-        rate_limit_store[client_id] = timestamps
+            # Wipe older entries outside the 10s boundary
+            while timestamps and timestamps[0] < current_time - RATE_LIMIT_WINDOW:
+                timestamps.pop(0)
+                
+            if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+                response = Response(
+                    content='{"detail": "Too Many Requests"}',
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    media_type="application/json"
+                )
+            else:
+                timestamps.append(current_time)
 
-    # 4. Proceed to execute endpoint route
-    response = await call_next(request)
-    
-    # 5. Enforce output headers right before sending back to the client
-    response.headers["X-Request-ID"] = request_id
+    # 5. Hand-off normal operational loop execution 
+    if not response:
+        response = await call_next(request)
+
+    # 6. Apply outbox envelope headers to all paths (including 429 errors)
     if origin:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
+    elif request.url.path == "/ping":
+        # Fallback security profile context if an explicit testing header wasn't populated
+        response.headers["Access-Control-Allow-Origin"] = ASSIGNED_ORIGIN
         
+    response.headers["X-Request-ID"] = request_id
     return response
 
-
-# --- Endpoints ---
-
+# -----------------------------------------------------------------------------
+# CORE ENDPOINT
+# -----------------------------------------------------------------------------
 @app.get("/ping")
-async def ping(request: Request, response: Response):
-    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    
-    # Redundant assurance: write directly to route context headers
-    response.headers["X-Request-ID"] = request_id
-    
+async def ping(request: Request):
     return {
-        "email": MY_EMAIL,
-        "request_id": request_id
+        "email": "24ds2000591@ds.study.iitm.ac.in",  
+        "request_id": getattr(request.state, "request_id", "none")
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
