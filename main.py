@@ -2,7 +2,7 @@ import time
 import uuid
 from typing import Dict, List
 from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI(redirect_slashes=False)
 
@@ -15,12 +15,34 @@ MY_EMAIL = "24f3000591@ds.study.iitm.ac.in"  # Replace with your logged-in email
 # Strict In-Memory Sliding-Window Rate Limiter
 rate_limit_store: Dict[str, List[float]] = {}
 
-# --- 1. Catch-All Dynamic CORS Middleware ---
-@app.middleware("http")
-async def dynamic_cors_middleware(request: Request, call_next):
+# --- Global HTTP Exception Override ---
+# This ensures that if any HTTPException (like a 429) occurs, the X-Request-ID 
+# and CORS headers are explicitly preserved in the generated error response.
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     origin = request.headers.get("origin")
     
-    # Handle preflight OPTIONS requests immediately
+    headers = dict(exc.headers) if exc.headers else {}
+    headers["X-Request-ID"] = request_id
+    
+    if origin:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers
+    )
+
+
+# --- Unified Middleware Pipeline ---
+@app.middleware("http")
+async def unified_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    
+    # 1. Handle preflight OPTIONS requests immediately
     if request.method == "OPTIONS":
         response = Response(status_code=status.HTTP_200_OK)
         if origin:
@@ -30,30 +52,15 @@ async def dynamic_cors_middleware(request: Request, call_next):
             response.headers["Access-Control-Allow-Credentials"] = "true"
         return response
 
-    response = await call_next(request)
-    
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        
-    return response
-
-
-# --- 2. Request Context & Rate Limiter Pipeline ---
-@app.middleware("http")
-async def process_request_pipeline(request: Request, call_next):
-    if request.method == "OPTIONS":
-        return await call_next(request)
-
-    # Resolve Request ID immediately
+    # 2. Resolve and capture Request ID early
     request_id = request.headers.get("X-Request-ID")
     if not request_id:
         request_id = str(uuid.uuid4())
     
-    # Make request_id accessible globally via state
+    # Cache it in request state so it is accessible globally
     request.state.request_id = request_id
 
-    # Rate Limiting Logic
+    # 3. Rate Limiting Check
     client_id = request.headers.get("X-Client-Id")
     if client_id:
         now = time.time()
@@ -62,30 +69,24 @@ async def process_request_pipeline(request: Request, call_next):
         
         if len(timestamps) >= BUCKET_SIZE:
             rate_limit_store[client_id] = timestamps
-            
-            origin = request.headers.get("origin")
-            headers = {
-                "Retry-After": "5",
-                "X-Request-ID": request_id  # Ensure request ID is present on 429 errors
-            }
-            if origin:
-                headers["Access-Control-Allow-Origin"] = origin
-                headers["Access-Control-Allow-Credentials"] = "true"
-                
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Rate limit exceeded",
-                headers=headers
+                headers={"Retry-After": "5"}
             )
             
         timestamps.append(now)
         rate_limit_store[client_id] = timestamps
 
-    # Process the request down to the path operation
+    # 4. Proceed to execute endpoint route
     response = await call_next(request)
     
-    # Explicitly enforce injection into outbound response headers
+    # 5. Enforce output headers right before sending back to the client
     response.headers["X-Request-ID"] = request_id
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        
     return response
 
 
@@ -93,11 +94,9 @@ async def process_request_pipeline(request: Request, call_next):
 
 @app.get("/ping")
 async def ping(request: Request, response: Response):
-    # Retrieve the resolved request ID from the state layer
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     
-    # Explicitly setting it directly on the route response payload and headers 
-    # provides an absolute fallback guarantee.
+    # Redundant assurance: write directly to route context headers
     response.headers["X-Request-ID"] = request_id
     
     return {
